@@ -14,6 +14,16 @@ An optional YAML configuration file can be used to exclude images:
 - poolExclude: list of pool names to skip.
 - excludeRegex: list of regular expressions matched against "pool/image".
 
+Performance data emitted by the plugin includes:
+
+- Number of mirrored images currently synchronized and up
+- Number of images in replaying state
+- Number of images in stopped state
+- Number of images excluded by configuration
+- Number of excluded images that are currently up
+- Number of images with errors (unsynchronized, stale, or misconfigured)
+- Total number of images checked (excluding excluded images)
+
 When invoked with the -m option, the plugin prints the rbd commands
 required to enable snapshot-based mirroring for images where mirroring
 is currently disabled.
@@ -28,7 +38,7 @@ Use the -h option to display all available command-line parameters.
 __author__ = 'Juan Ferrer Toribio <juan@verdnatura.es>'
 __copyright__ = 'Copyright (c) 2025 Verdnatura Levante SL'
 __license__ = 'GPLv3'
-__version__ = '1.0.0'
+__version__ = '1.0.1'
 
 import rados
 import rbd
@@ -40,6 +50,12 @@ import re
 import yaml
 import os
 from enum import IntEnum
+
+class Status(IntEnum):
+    OK = 0
+    WARNING = 1
+    CRITICAL = 2
+    UNKNOWN = 3
 
 class PoolModes(IntEnum):
     NONE = 0
@@ -73,6 +89,14 @@ parser.add_argument('-t', '--cutoff',
     default=129600, # 36 hours
     type=int,
 )
+parser.add_argument('-w', '--warn-excluded',
+    help="Show warning when excluded image is up",
+    action='store_true',
+)
+parser.add_argument('-s', '--show-excluded',
+    help="Show excluded image statuses",
+    action='store_true',
+)
 parser.add_argument('-m', '--commands',
     help="Display commands to enable mirroring",
     action='store_true',
@@ -83,7 +107,7 @@ parser.add_argument('-f', '--cconf',
 )
 args = parser.parse_args()
 
-# Check configuration
+# Fetch configuration
 
 conf = {
     'poolExclude': [],
@@ -124,108 +148,149 @@ try:
     cluster.connect()
 except Exception as e:
     print(f"CRITICAL - Cannot connect to Ceph cluster: {e}")
-    sys.exit(2)
+    sys.exit(Status.CRITICAL)
 
 # Iterate over snapshot mirrored pools
 
-n_excluded = 0
-n_up = 0
-n_stopped = 0
-n_replaying = 0
-n_total = 0
-img_errors = {}
+try:
+    n_up = 0
+    n_excluded_up = 0
+    n_stopped = 0
+    n_replaying = 0
+    n_total = 0
+    img_check_statuses = {}
+    img_errors = set()
+    img_excluded = set()
 
-for pool in cluster.list_pools():
-    if pool in pool_exclude:
-        continue
+    for pool in cluster.list_pools():
+        if pool in pool_exclude:
+            continue
 
-    try:
-        ioctx = cluster.open_ioctx(pool)
-        rbd_inst = rbd.RBD()
-        images = rbd_inst.list(ioctx)
-    except Exception as e:
-        print(f"CRITICAL - Error opening pool {pool}: {e}")
-        sys.exit(2)
+        try:
+            ioctx = cluster.open_ioctx(pool)
+            rbd_inst = rbd.RBD()
+            images = rbd_inst.list(ioctx)
+        except Exception as e:
+            print(f"CRITICAL - Error opening pool {pool}: {e}")
+            sys.exit(Status.CRITICAL)
 
-    mirror_mode = rbd_inst.mirror_mode_get(ioctx)
-    if mirror_mode != PoolModes.IMAGE:
+        mirror_mode = rbd_inst.mirror_mode_get(ioctx)
+        if mirror_mode != PoolModes.IMAGE:
+            ioctx.close()
+            continue
+
+        statuses = rbd_inst.mirror_image_status_list(ioctx)
+        img_statuses = {status['name']: status for status in statuses}
         ioctx.close()
-        continue
 
-    statuses = rbd_inst.mirror_image_status_list(ioctx)
-    img_statuses = {status['name']: status for status in statuses}
+        # Iterate over images
 
-    # Iterate over images
+        for img_name in images:
+            img_full_name = f'{pool}/{img_name}'
 
-    for img_name in images:
-        img_full_name = f'{pool}/{img_name}'
-        if exclude_regex:
             excluded = False
-            for regex in exclude_regex:
-                if regex.match(img_full_name):
-                    excluded = True
-                    break
-            if excluded:
-                n_excluded +=1
-                continue
+            if exclude_regex:
+                for regex in exclude_regex:
+                    if regex.match(img_full_name):
+                        excluded = True
+                        break
 
-        n_total += 1
-        img_error = ''
+            if not excluded:
+                n_total += 1
 
-        img_status = img_statuses.get(img_name)
-        if img_status:
-            state = img_status['state']
-            if state == ImageState.UP_STOPPED:
-                n_stopped += 1
-                peers = img_status.get('remote_statuses', [])
-                if peers and len(peers) > 0:
-                    description = peers[0]['description']
-                    desc_json_str = description.split(',', 1)[-1].strip()
-                    try:
-                        desc_json = json.loads(desc_json_str)
-                        local_stamp = desc_json.get('local_snapshot_timestamp', 0)
-                        remote_stamp = desc_json.get('remote_snapshot_timestamp', 0)
-                        if remote_stamp < snap_cutoff:
-                            img_error = 'snap+desync'
-                        elif local_stamp < snap_cutoff:
-                            img_error = 'snap+old'
-                    except json.JSONDecodeError:
-                        img_error = 'json+invalid'
+            img_is_up = False
+            img_check_status = ''
+            img_status = img_statuses.get(img_name)
+
+            if img_status:
+                state = img_status.get('state')
+                if state == ImageState.UP_STOPPED:
+                    peers = img_status.get('remote_statuses', [])
+                    if peers and len(peers) > 0:
+                        description = peers[0].get('description', '')
+                        desc_json_str = description.split(',', 1)[-1].strip()
+                        try:
+                            desc_json = json.loads(desc_json_str)
+                            local_stamp = desc_json.get('local_snapshot_timestamp', 0)
+                            remote_stamp = desc_json.get('remote_snapshot_timestamp', 0)
+                            if remote_stamp < snap_cutoff:
+                                img_check_status = 'snap+desync'
+                            elif local_stamp < snap_cutoff:
+                                img_check_status = 'snap+old'
+                            else:
+                                img_check_status = 'up+stopped'
+                                img_is_up = True
+                        except json.JSONDecodeError:
+                            img_check_status = 'json+invalid'
+                    else:
+                        img_check_status = 'peer+empty'
+                elif state == ImageState.UP_REPLAYING:
+                    img_check_status = 'up+replaying'
+                    img_is_up = True
                 else:
-                    img_error = 'peer+empty'
-            elif state == ImageState.UP_REPLAYING:
-                n_replaying += 1
+                    img_check_status = 'state+unknown'
             else:
-                img_error = 'state+unknown'
-        else:
-            img_error = 'mirror+disabled'
+                img_check_status = 'mirror+disabled'
 
-        if not img_error:
-            n_up += 1
-        else:
-            img_errors[img_full_name] = img_error
+            if excluded:
+                img_excluded.add(img_full_name)
+                if img_is_up:
+                    n_excluded_up += 1
+            elif not img_is_up:
+                img_errors.add(img_full_name)
+            else:
+                n_up += 1
+                match state:
+                    case ImageState.UP_STOPPED:
+                        n_stopped += 1
+                    case ImageState.UP_REPLAYING:
+                        n_replaying += 1
+                
 
-    ioctx.close()
-
-cluster.shutdown()
+            img_check_statuses[img_full_name] = img_check_status
+finally:
+    cluster.shutdown()
 
 # Output results
 
 if args.commands:
     for img in sorted(img_errors):
-        if img_errors[img] == 'mirror+disabled':
+        if img_check_statuses[img] == 'mirror+disabled':
             print(f'rbd mirror image enable "{img}" snapshot')
     sys.exit(0)
 
 n_errors = len(img_errors)
-perf_data = f'n_up={n_up} n_replaying={n_replaying} n_stopped={n_stopped} n_excluded={n_excluded}'
+n_excluded = len(img_excluded)
 
-if n_errors == 0:
-    print(f"OK - All {n_up} images up | {perf_data}")
-    sys.exit(0)
-else:
+perf_data = (
+    f'n_up={n_up} n_replaying={n_replaying} n_stopped={n_stopped} '
+    f'n_excluded={n_excluded} n_excluded_up={n_excluded_up}'
+)
+
+if n_errors:
     perf_data = f'n_errors={n_errors} n_total={n_total} {perf_data}'
-    print(f"CRITICAL - {n_errors} of {n_total} images unsynchronized | {perf_data}")
+    status_text = f"{n_errors} of {n_total} images unsynchronized"
+    exit_status = Status.CRITICAL
+else:
+    status_text = f"All {n_up} images up"
+    if n_excluded_up:
+        status_text = f"{status_text}, {n_excluded_up} excluded but up"
+
+    if n_excluded_up and args.warn_excluded:
+        exit_status = Status.WARNING
+    else:
+        exit_status = Status.OK
+
+print(f"{Status(exit_status).name} - {status_text} | {perf_data}")
+
+if n_errors:
+    print('errors:')
     for img in sorted(img_errors):
-        print(f"{img} => {img_errors[img]}")
-    sys.exit(2)
+        print(f"- {img} => {img_check_statuses[img]}")
+
+if n_excluded and (args.show_excluded or args.warn_excluded):
+    print('excluded:')
+    for img in sorted(img_excluded):
+        print(f"- {img} => {img_check_statuses[img]}")
+
+sys.exit(exit_status)
