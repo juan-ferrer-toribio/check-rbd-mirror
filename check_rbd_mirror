@@ -38,7 +38,7 @@ Use the -h option to display all available command-line parameters.
 __author__ = 'Juan Ferrer Toribio <juan@verdnatura.es>'
 __copyright__ = 'Copyright (c) 2025 Verdnatura Levante SL'
 __license__ = 'GPLv3'
-__version__ = '1.0.1'
+__version__ = '1.0.2'
 
 import rados
 import rbd
@@ -98,7 +98,7 @@ parser.add_argument('-s', '--show-excluded',
     action='store_true',
 )
 parser.add_argument('-m', '--commands',
-    help="Display commands to enable mirroring",
+    help="Display commands to enable mirroring on non-excluded disabled images",
     action='store_true',
 )
 parser.add_argument('-f', '--cconf',
@@ -236,16 +236,15 @@ try:
                 img_excluded.add(img_full_name)
                 if img_is_up:
                     n_excluded_up += 1
-            elif not img_is_up:
-                img_errors.add(img_full_name)
-            else:
+            elif img_is_up:
                 n_up += 1
                 match state:
                     case ImageState.UP_STOPPED:
                         n_stopped += 1
                     case ImageState.UP_REPLAYING:
                         n_replaying += 1
-                
+            else:
+                img_errors.add(img_full_name)
 
             img_check_statuses[img_full_name] = img_check_status
 finally:
