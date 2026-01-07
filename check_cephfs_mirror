@@ -45,7 +45,7 @@ parser = argparse.ArgumentParser(
     description="Ceph RBD mirror health Nagios plugin."
 )
 parser.add_argument('-c', '--conf',
-    help="Alternative ceph conf file",
+    help="Alternative ceph conf file (default: %(default)s)",
     default='/etc/ceph/ceph.conf',
 )
 parser.add_argument('-k', '--keyring',
@@ -55,7 +55,7 @@ parser.add_argument('-n', '--name',
     help="Ceph client name",
 )
 parser.add_argument('-i', '--id',
-    help="Ceph client name",
+    help="Ceph client name (default: %(default)s)",
     default='admin',
 )
 args = parser.parse_args()
