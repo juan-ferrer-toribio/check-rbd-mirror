@@ -38,7 +38,7 @@ Use the -h option to display all available command-line parameters.
 __author__ = 'Juan Ferrer Toribio <juan@verdnatura.es>'
 __copyright__ = 'Copyright (c) 2025 Verdnatura Levante SL'
 __license__ = 'GPLv3'
-__version__ = '1.0.2'
+__version__ = '1.0.1'
 
 import rados
 import rbd
@@ -71,7 +71,7 @@ parser = argparse.ArgumentParser(
     description="Ceph RBD mirror health Nagios plugin."
 )
 parser.add_argument('-c', '--conf',
-    help="Alternative ceph conf file",
+    help="Alternative ceph conf file (default: %(default)s)",
     default='/etc/ceph/ceph.conf',
 )
 parser.add_argument('-k', '--keyring',
@@ -85,8 +85,13 @@ parser.add_argument('-i', '--id',
     default='admin',
 )
 parser.add_argument('-t', '--cutoff',
-    help="Snapshot age cut-off seconds",
+    help="Snapshot age cut-off seconds (default: %(default)s)",
     default=129600, # 36 hours
+    type=int,
+)
+parser.add_argument('-a', '--age',
+    help="Exclude mirror disabled images newer than age (default: %(default)s)",
+    default=10800, # 3 hours
     type=int,
 )
 parser.add_argument('-w', '--warn-excluded',
@@ -98,11 +103,11 @@ parser.add_argument('-s', '--show-excluded',
     action='store_true',
 )
 parser.add_argument('-m', '--commands',
-    help="Display commands to enable mirroring on non-excluded disabled images",
+    help="Display commands to enable mirroring",
     action='store_true',
 )
 parser.add_argument('-f', '--cconf',
-    help="Check configuration file",
+    help="Check configuration file (default: %(default)s)",
     default='/etc/nagios/check_rbd_mirror.yaml',
 )
 args = parser.parse_args()
@@ -127,9 +132,13 @@ if conf['excludeRegex']:
 else:
     exclude_regex = None
 
-snap_cutoff = int(time.time()) - args.cutoff
+now = int(time.time())
+snap_cutoff = now - args.cutoff
 
 # Connect to Ceph cluster
+
+cluster = None
+ioctx = None
 
 try:
     keyring = args.keyring
@@ -181,7 +190,6 @@ try:
 
         statuses = rbd_inst.mirror_image_status_list(ioctx)
         img_statuses = {status['name']: status for status in statuses}
-        ioctx.close()
 
         # Iterate over images
 
@@ -194,9 +202,6 @@ try:
                     if regex.match(img_full_name):
                         excluded = True
                         break
-
-            if not excluded:
-                n_total += 1
 
             img_is_up = False
             img_check_status = ''
@@ -230,24 +235,42 @@ try:
                 else:
                     img_check_status = 'state+unknown'
             else:
+                if not excluded:
+                    img_info = rbd.Image(ioctx, img_name, read_only=True)
+                    try:
+                        img_created = int(img_info.create_timestamp().timestamp())
+                        if img_created >= now - args.age:
+                            excluded = True
+                    finally:
+                        img_info.close()
+
                 img_check_status = 'mirror+disabled'
+
+            if not excluded:
+                n_total += 1
 
             if excluded:
                 img_excluded.add(img_full_name)
                 if img_is_up:
                     n_excluded_up += 1
-            elif img_is_up:
+            elif not img_is_up:
+                img_errors.add(img_full_name)
+            else:
                 n_up += 1
                 match state:
                     case ImageState.UP_STOPPED:
                         n_stopped += 1
                     case ImageState.UP_REPLAYING:
                         n_replaying += 1
-            else:
-                img_errors.add(img_full_name)
+                
 
             img_check_statuses[img_full_name] = img_check_status
+
+        ioctx.close()
+        ioctx = None
 finally:
+    if ioctx:
+        ioctx.close()
     cluster.shutdown()
 
 # Output results
